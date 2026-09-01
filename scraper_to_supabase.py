@@ -1,17 +1,16 @@
 """
-scraper_to_supabase.py
+scraper_to_lovable_api.py
 
-Same two-stage scrape as the standalone version (Overpass sourcing +
-Playwright/Google Maps verification for no-website, few-review leads),
-but writes results directly into your Supabase `leads` table instead of
-a local CSV. Built to run in GitHub Actions (see workflow file), so it
-uses Supabase itself as the "already checked" tracker -- no local state
-needed between runs on ephemeral CI machines.
+Same two-stage scrape (Overpass sourcing + Playwright/Google Maps
+verification for no-website, few-review leads) as before, but writes
+through your Lovable backend's public API instead of talking to
+Supabase directly -- Lovable Cloud doesn't expose the service_role
+key, so this is the supported path.
 
 Required environment variables (set as GitHub Actions secrets):
-    SUPABASE_URL               e.g. https://xxxxx.supabase.co
-    SUPABASE_SERVICE_ROLE_KEY  service role key (server-side only, never
-                                exposed to the frontend)
+    APP_BASE_URL        e.g. https://your-app.lovable.app
+    SCRAPER_API_TOKEN    the shared token you set as a backend secret
+                          in Lovable (see lovable_backend_routes_prompt.md)
 
 Setup:
     pip install requests playwright
@@ -43,60 +42,42 @@ NICHE_QUERIES = {
 }
 NICHES_TO_RUN = ["hvac", "plumbing", "roofing", "electrician"]
 
-TARGET_TIER_A_COUNT = 500   # stop once this many Tier A (no site, few reviews) leads exist total
+TARGET_TIER_A_COUNT = 500
 MAX_REVIEWS = 15
 MIN_REVIEWS = 0
 DELAY_SECONDS = 3
-MAX_CANDIDATES_PER_RUN = 800  # safety cap so one Actions run can't blow past the time limit
+MAX_CANDIDATES_PER_RUN = 800
 
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+APP_BASE_URL = os.environ.get("APP_BASE_URL", "").rstrip("/")
+SCRAPER_API_TOKEN = os.environ.get("SCRAPER_API_TOKEN")
 # -----------------------------------------
 
 
-def supabase_headers():
+def api_headers():
     return {
-        "apikey": SUPABASE_KEY,
-        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Authorization": f"Bearer {SCRAPER_API_TOKEN}",
         "Content-Type": "application/json",
     }
 
 
-def fetch_existing_osm_ids():
-    """Pulls every osm_id already in Supabase so Stage 2 can skip re-checking them."""
-    ids = set()
-    offset = 0
-    page_size = 1000
-    while True:
-        headers = {**supabase_headers(), "Range": f"{offset}-{offset + page_size - 1}"}
-        resp = requests.get(f"{SUPABASE_URL}/rest/v1/leads?select=osm_id", headers=headers, timeout=30)
-        resp.raise_for_status()
-        page = resp.json()
-        ids.update(row["osm_id"] for row in page if row.get("osm_id"))
-        if len(page) < page_size:
-            break
-        offset += page_size
-    return ids
-
-
-def count_tier_a():
-    headers = {**supabase_headers(), "Prefer": "count=exact"}
-    resp = requests.get(f"{SUPABASE_URL}/rest/v1/leads?tier=eq.A&select=id", headers=headers, timeout=30)
+def fetch_status():
+    """Returns (set of known osm_ids, current tier A count) from your app."""
+    resp = requests.get(f"{APP_BASE_URL}/api/public/leads/status",
+                         headers=api_headers(), timeout=30)
     resp.raise_for_status()
-    content_range = resp.headers.get("Content-Range", "*/0")
-    return int(content_range.split("/")[-1])
+    data = resp.json()
+    return set(data.get("osm_ids", [])), int(data.get("tier_a_count", 0))
 
 
 def upsert_leads(rows):
     if not rows:
         return
-    headers = {**supabase_headers(), "Prefer": "resolution=merge-duplicates,return=minimal"}
-    resp = requests.post(f"{SUPABASE_URL}/rest/v1/leads?on_conflict=osm_id",
-                          headers=headers, json=rows, timeout=30)
+    resp = requests.post(f"{APP_BASE_URL}/api/public/leads/upsert",
+                          headers=api_headers(), json={"leads": rows}, timeout=30)
     if resp.status_code >= 300:
-        print(f"  WARNING: Supabase upsert failed ({resp.status_code}): {resp.text[:300]}")
+        print(f"  WARNING: upsert failed ({resp.status_code}): {resp.text[:300]}")
 
 
 # ---------- STAGE 1: Overpass sourcing ----------
@@ -218,12 +199,12 @@ def make_icebreaker(name, has_website, rating, reviews):
 
 
 def main():
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        print("ERROR: SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set as environment variables.")
+    if not APP_BASE_URL or not SCRAPER_API_TOKEN:
+        print("ERROR: APP_BASE_URL and SCRAPER_API_TOKEN must be set as environment variables.")
         sys.exit(1)
 
-    existing_tier_a = count_tier_a()
-    print(f"Currently {existing_tier_a}/{TARGET_TIER_A_COUNT} Tier A leads in Supabase.")
+    already_checked, existing_tier_a = fetch_status()
+    print(f"Currently {existing_tier_a}/{TARGET_TIER_A_COUNT} Tier A leads on record.")
     if existing_tier_a >= TARGET_TIER_A_COUNT:
         print("Target already met. Nothing to do this run.")
         return
@@ -231,7 +212,6 @@ def main():
     candidates = gather_raw_candidates()
     print(f"\n{len(candidates)} unique raw candidates from Overpass.")
 
-    already_checked = fetch_existing_osm_ids()
     remaining = [c for c in candidates if c["osm_id"] not in already_checked]
     random.shuffle(remaining)
     remaining = remaining[:MAX_CANDIDATES_PER_RUN]
