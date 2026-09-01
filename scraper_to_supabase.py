@@ -65,7 +65,15 @@ MIN_REVIEWS = 0
 DELAY_SECONDS = 3
 MAX_CANDIDATES_PER_RUN = 800
 
-OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+OVERPASS_ENDPOINTS = [
+    "https://overpass-api.de/api/interpreter",
+    "https://lz4.overpass-api.de/api/interpreter",
+    "https://z.overpass-api.de/api/interpreter",
+    "https://overpass.openstreetmap.fr/api/interpreter",
+]
+OVERPASS_HEADERS = {
+    "User-Agent": "LeanLaunchLeadGen/1.0 (contact@leanlaunch.local)",
+}
 
 APP_BASE_URL = os.environ.get("APP_BASE_URL", "").rstrip("/")
 SCRAPER_API_TOKEN = os.environ.get("SCRAPER_API_TOKEN")
@@ -107,30 +115,42 @@ def build_query(lat, lon, radius, tag_filters):
 
 def fetch_city_niche(city_name, lat, lon, radius, niche):
     query = build_query(lat, lon, radius, NICHE_QUERIES[niche])
-    resp = requests.post(OVERPASS_URL, data={"data": query}, timeout=90)
-    resp.raise_for_status()
-    rows = []
-    for el in resp.json().get("elements", []):
-        tags = el.get("tags", {})
-        name = tags.get("name")
-        if not name:
+    last_err = None
+    for endpoint in OVERPASS_ENDPOINTS:
+        try:
+            resp = requests.post(endpoint, data={"data": query}, headers=OVERPASS_HEADERS, timeout=60)
+            if resp.status_code == 200:
+                rows = []
+                for el in resp.json().get("elements", []):
+                    tags = el.get("tags", {})
+                    name = tags.get("name")
+                    if not name:
+                        continue
+                    elat = el.get("lat") or el.get("center", {}).get("lat")
+                    elon = el.get("lon") or el.get("center", {}).get("lon")
+                    addr_parts = [tags.get("addr:housenumber", ""), tags.get("addr:street", ""),
+                                  tags.get("addr:city", "") or city_name.split(",")[0],
+                                  tags.get("addr:state", "CO"), tags.get("addr:postcode", "")]
+                    rows.append({
+                        "osm_id": f"{niche}_{el.get('id')}",
+                        "name": name,
+                        "address": " ".join(p for p in addr_parts if p).strip(),
+                        "osm_website": tags.get("website") or tags.get("contact:website", ""),
+                        "niche": niche,
+                        "city": city_name,
+                        "lat": elat,
+                        "lon": elon,
+                    })
+                return rows
+            elif resp.status_code == 429:
+                time.sleep(2)
+                continue
+            else:
+                last_err = f"HTTP {resp.status_code}"
+        except Exception as e:
+            last_err = e
             continue
-        elat = el.get("lat") or el.get("center", {}).get("lat")
-        elon = el.get("lon") or el.get("center", {}).get("lon")
-        addr_parts = [tags.get("addr:housenumber", ""), tags.get("addr:street", ""),
-                      tags.get("addr:city", "") or city_name.split(",")[0],
-                      tags.get("addr:state", "CO"), tags.get("addr:postcode", "")]
-        rows.append({
-            "osm_id": f"{niche}_{el.get('id')}",
-            "name": name,
-            "address": " ".join(p for p in addr_parts if p).strip(),
-            "osm_website": tags.get("website") or tags.get("contact:website", ""),
-            "niche": niche,
-            "city": city_name,
-            "lat": elat,
-            "lon": elon,
-        })
-    return rows
+    raise RuntimeError(f"All Overpass endpoints failed. Last error: {last_err}")
 
 
 def gather_raw_candidates():
